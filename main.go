@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -27,11 +26,11 @@ type EntityCache struct {
 	Entities []Entity
 }
 
-const CACHE_REVALIDATE_INTERVAL = 5 * time.Second
+const CACHE_REVALIDATE_INTERVAL = 15 * time.Second
 
 var (
-	entityCache       *EntityCache
-	enitityCollection *mongo.Collection
+	entityCache      *EntityCache
+	entityCollection *mongo.Collection
 )
 
 func main() {
@@ -41,12 +40,15 @@ func main() {
 	dbCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	dbClient, err := mongo.Connect(dbCtx, options.Client().ApplyURI(os.Getenv("MONGODB_URI")))
+	if err != nil {
+		log.Fatal(err)
+	}
 	defer func() {
 		if err = dbClient.Disconnect(dbCtx); err != nil {
 			log.Fatal(err)
 		}
 	}()
-	enitityCollection = dbClient.Database("main").Collection("entity")
+	entityCollection = dbClient.Database("main").Collection("entity")
 
 	// Init cache
 	entityCache = &EntityCache{}
@@ -90,25 +92,81 @@ func GetEntitiesHandler(w http.ResponseWriter, r *http.Request) {
 	entities := entityCache.Entities
 	entityCache.lock.RUnlock()
 
-	bytes, _ := json.Marshal(entities)
-
 	w.Header().Add("Content-Type", "application/json")
-	w.Write(bytes)
+	json.NewEncoder(w).Encode(entities)
 }
 
 func CreateEntityHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintln(w, "not implemented yet!")
+	var payload Entity
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := entityCollection.InsertOne(ctx, &Entity{
+		ID:    primitive.NewObjectID(),
+		Title: payload.Title,
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Add("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(result)
 }
 
 func UpdateEntityHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintln(w, "not implemented yet!")
+	params := mux.Vars(r)
+	entityId := params["id"]
+
+	objId, err := primitive.ObjectIDFromHex(entityId)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var payload Entity
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	update := bson.M{"title": payload.Title}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result := entityCollection.FindOneAndUpdate(ctx, bson.M{"_id": objId}, bson.M{"$set": update})
+
+	var parsedResult Entity
+	if err := result.Decode(&parsedResult); err != nil {
+		if err == mongo.ErrNoDocuments {
+			http.Error(w, "can't find specified document", http.StatusBadRequest)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	var updatedEntity Entity
+	if err := entityCollection.FindOne(ctx, bson.M{"_id": objId}).Decode(&updatedEntity); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Add("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(updatedEntity)
 }
 
 func getAllEntities() ([]Entity, bool) {
 	var entities []Entity
 
-	ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
-	cursor, err := enitityCollection.Find(ctx, bson.M{})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cursor, err := entityCollection.Find(ctx, bson.M{})
 	if err != nil {
 		log.Println("Couldn't fetch entities - ", err.Error())
 		return []Entity{}, false
